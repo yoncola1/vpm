@@ -9,6 +9,9 @@ CACHE_DIR="/var/cache/vpm"
 INDEX_FILE="/var/cache/vpm/APKINDEX"
 ARCH="x86_64"
 ALPINE_VER="edge"
+REPOS="main community"
+MIN_EDGE_MUSL="1.2.5"
+INSTALL_STACK="${INSTALL_STACK:-}"
 
 # ---------------------------------------------------------------------------
 # Mirrors
@@ -34,7 +37,7 @@ show_help() {
     echo "  vpm update               - sync package index"
     echo "  vpm search <pkg>         - search for package"
     echo "  vpm info <pkg>           - show package info"
-    echo "  vpm install <pkg>        - install package"
+    echo "  vpm install <pkg>        - install package with deps and post-install fixes"
     echo "  vpm remove <pkg>         - remove package"
     echo "  vpm list                 - list installed packages"
     echo "  vpm upgrade              - upgrade all installed packages"
@@ -66,12 +69,6 @@ ensure_index() {
     fi
 }
 
-# Парсим APKINDEX — поля разделены переносами строк, записи пустой строкой
-# P: name
-# V: version
-# S: size
-# D: depends
-# T: description
 pkg_field() {
     PKG="$1"
     FIELD="$2"
@@ -80,6 +77,164 @@ pkg_field() {
         /^P:/ { if ($0 == "P:"pkg) found=1 }
         found && /^[A-Z]:/ { if (substr($0,1,2) == field":") { print substr($0,3); exit } }
     ' "$INDEX_FILE"
+}
+
+pkg_exists() {
+    [ -n "$(pkg_field "$1" V)" ]
+}
+
+normalize_dep() {
+    DEP="$1"
+    DEP=${DEP#!}
+    case "$DEP" in
+        ""|cmd:*|so:*|pc:*|*.so.*|*.so) return 1 ;;
+    esac
+    DEP=${DEP%%[<>=~]*}
+    case "$DEP" in
+        ""|*:*) return 1 ;;
+        *) printf '%s\n' "$DEP" ;;
+    esac
+}
+
+version_ge() {
+    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]
+}
+
+musl_version() {
+    for LOADER in /usr/lib/libc.so /lib/ld-musl-x86_64.so.1 /lib/libc.musl-x86_64.so.1; do
+        [ -x "$LOADER" ] || [ -f "$LOADER" ] || continue
+        "$LOADER" 2>&1 | awk '/Version / { sub(/^Version /, ""); sub(/-.*/, ""); print; exit }'
+        return
+    done
+}
+
+needs_edge_musl() {
+    CUR=$(musl_version)
+    [ -n "$CUR" ] || return 1
+    version_ge "$CUR" "$MIN_EDGE_MUSL"
+}
+
+make_tmpdir() {
+    mktemp -d "${TMPDIR:-/tmp}/vpm.XXXXXX"
+}
+
+download_pkg() {
+    PKG="$1"
+    VER="$2"
+    APK_FILE="${PKG}-${VER}.apk"
+    MIRROR=$(get_mirror)
+
+    if [ -f "${CACHE_DIR}/${APK_FILE}" ]; then
+        echo "[ . ] Using cached $APK_FILE"
+        return 0
+    fi
+
+    for REPO in $REPOS; do
+        URL="${MIRROR}/${ALPINE_VER}/${REPO}/${ARCH}/${APK_FILE}"
+        echo "[ . ] Downloading $PKG-$VER from $REPO..."
+        if curl -sSf -o "${CACHE_DIR}/${APK_FILE}" "$URL"; then
+            return 0
+        fi
+    done
+
+    rm -f "${CACHE_DIR}/${APK_FILE}"
+    return 1
+}
+
+run_pkg_script() {
+    SCRIPT="$1"
+    PKG="$2"
+    VER="$3"
+    if [ -f "$SCRIPT" ]; then
+        chmod +x "$SCRIPT" 2>/dev/null
+        echo "[ . ] Running $(basename "$SCRIPT") for $PKG..."
+        VPM_POST_INSTALL=1 /bin/sh "$SCRIPT" "$PKG" "$VER" || echo "[ ! ] $(basename "$SCRIPT") for $PKG failed, continuing"
+    fi
+}
+
+extract_apk_payload() {
+    APK_FILE="$1"
+    WORKDIR="$2"
+    DEST="$3"
+
+    ( cd "$WORKDIR" && tar -xzf "$APK_FILE" 2>/dev/null )
+    if [ -f "$WORKDIR/data.tar.gz" ]; then
+        tar -xzf "$WORKDIR/data.tar.gz" -C "$DEST"
+    else
+        tar -xzf "$APK_FILE" -C "$DEST" --exclude='.PKGINFO' --exclude='.pre-install' --exclude='.post-install' 2>/dev/null
+    fi
+}
+
+record_filelist() {
+    APK_FILE="$1"
+    WORKDIR="$2"
+    PKG="$3"
+    if [ -f "$WORKDIR/data.tar.gz" ]; then
+        tar -tzf "$WORKDIR/data.tar.gz" | sed 's#^#/#' > "$DB_DIR/$PKG.files"
+    else
+        tar -tzf "$APK_FILE" | grep -v '^\.PKGINFO$' | grep -v '^\.pre-install$' | grep -v '^\.post-install$' | sed 's#^#/#' > "$DB_DIR/$PKG.files"
+    fi
+}
+
+ensure_runtime_compat() {
+    PKG="$1"
+    [ "$ALPINE_VER" = "edge" ] || return 0
+    [ "$PKG" = "musl" ] && return 0
+    [ -f "$DB_DIR/musl" ] && return 0
+    if ! needs_edge_musl; then
+        CUR=$(musl_version)
+        echo "[ ! ] System musl ${CUR:-unknown} is older than Alpine edge runtime ($MIN_EDGE_MUSL+)"
+        echo "[ . ] Installing musl first to prevent instant segfaults..."
+        cmd_install musl || {
+            echo "[ ! ] Failed to install compatible musl; aborting $PKG"
+            exit 1
+        }
+    fi
+}
+
+ensure_terminfo() {
+    [ -d /usr/share/terminfo ] && [ -n "$(find /usr/share/terminfo -type f 2>/dev/null | head -n 1)" ] && return 0
+    [ -f "$DB_DIR/ncurses-terminfo-base" ] && return 0
+    if pkg_exists ncurses-terminfo-base; then
+        echo "[ . ] Installing ncurses-terminfo-base for terminal programs..."
+        cmd_install ncurses-terminfo-base || echo "[ ! ] Could not install ncurses-terminfo-base"
+    fi
+}
+
+post_install_fixes() {
+    PKG="$1"
+
+    # Alpine packages expect these loader/libc names. Keep them sane after musl upgrades.
+    if [ -f /lib/libc.musl-x86_64.so.1 ]; then
+        ln -sf /lib/libc.musl-x86_64.so.1 /usr/lib/libc.so 2>/dev/null || true
+    fi
+    if [ -f /lib/ld-musl-x86_64.so.1 ] && [ ! -e /usr/lib/ld-musl-x86_64.so.1 ]; then
+        ln -sf /lib/ld-musl-x86_64.so.1 /usr/lib/ld-musl-x86_64.so.1 2>/dev/null || true
+    fi
+
+    case "$PKG" in
+        nano|fastfetch|htop|vim|neovim|ncurses|ncurses-terminfo*|terminfo*) ensure_terminfo ;;
+    esac
+
+    [ -x /sbin/ldconfig ] && /sbin/ldconfig 2>/dev/null || true
+}
+
+install_deps() {
+    PKG="$1"
+    DEPS=$(pkg_field "$PKG" D)
+    [ -n "$DEPS" ] || return 0
+
+    for RAW in $DEPS; do
+        DEP=$(normalize_dep "$RAW") || continue
+        [ "$DEP" = "$PKG" ] && continue
+        [ -f "$DB_DIR/$DEP" ] && continue
+        if pkg_exists "$DEP"; then
+            echo "[ . ] Dependency for $PKG: $DEP"
+            cmd_install "$DEP"
+        else
+            echo "[ ! ] Dependency '$RAW' for $PKG is not a direct package, skipping"
+        fi
+    done
 }
 
 # ---------------------------------------------------------------------------
@@ -116,19 +271,18 @@ cmd_mirror() {
 cmd_update() {
     ensure_dirs
     MIRROR=$(get_mirror)
-    REPOS="main community"
+    TMP_INDEX="${INDEX_FILE}.tmp"
 
     echo "[ . ] Syncing package index from $MIRROR ..."
-    rm -f "$INDEX_FILE"
+    rm -f "$TMP_INDEX"
 
     for REPO in $REPOS; do
         URL="${MIRROR}/${ALPINE_VER}/${REPO}/${ARCH}/APKINDEX.tar.gz"
         TMP="/tmp/APKINDEX_${REPO}.tar.gz"
         echo "[ . ] Fetching $REPO..."
         if curl -sSf -o "$TMP" "$URL"; then
-            # Распаковываем и добавляем к общему индексу
-            tar -xOf "$TMP" APKINDEX 2>/dev/null >> "$INDEX_FILE"
-            echo "" >> "$INDEX_FILE"
+            tar -xOf "$TMP" APKINDEX 2>/dev/null >> "$TMP_INDEX"
+            echo "" >> "$TMP_INDEX"
             rm -f "$TMP"
             echo "[ + ] $REPO OK"
         else
@@ -136,6 +290,8 @@ cmd_update() {
         fi
     done
 
+    [ -s "$TMP_INDEX" ] || { echo "[ ! ] No indexes downloaded"; rm -f "$TMP_INDEX"; exit 1; }
+    mv "$TMP_INDEX" "$INDEX_FILE"
     TOTAL=$(grep "^P:" "$INDEX_FILE" | wc -l)
     echo "[ + ] Done! $TOTAL packages available"
 }
@@ -143,22 +299,15 @@ cmd_update() {
 cmd_search() {
     ensure_index
     PKG="$1"
-    if [ -z "$PKG" ]; then
-        echo "[ ! ] Usage: vpm search <pkg>"
-        exit 1
-    fi
+    [ -n "$PKG" ] || { echo "[ ! ] Usage: vpm search <pkg>"; exit 1; }
 
     echo "[ . ] Searching for '$PKG'..."
     RESULTS=$(grep "^P:.*${PKG}" "$INDEX_FILE" | sed 's/^P://')
-
-    if [ -z "$RESULTS" ]; then
-        echo "[ ! ] No packages found matching '$PKG'"
-        exit 1
-    fi
+    [ -n "$RESULTS" ] || { echo "[ ! ] No packages found matching '$PKG'"; exit 1; }
 
     echo "$RESULTS" | while read -r NAME; do
-        VER=$(pkg_field "$NAME" "V")
-        DESC=$(pkg_field "$NAME" "T")
+        VER=$(pkg_field "$NAME" V)
+        DESC=$(pkg_field "$NAME" T)
         printf "  %-30s %-15s %s\n" "$NAME" "$VER" "$DESC"
     done
 }
@@ -166,119 +315,79 @@ cmd_search() {
 cmd_info() {
     ensure_index
     PKG="$1"
-    if [ -z "$PKG" ]; then
-        echo "[ ! ] Usage: vpm info <pkg>"
-        exit 1
-    fi
+    [ -n "$PKG" ] || { echo "[ ! ] Usage: vpm info <pkg>"; exit 1; }
 
-    VER=$(pkg_field "$PKG" "V")
-    if [ -z "$VER" ]; then
-        echo "[ ! ] Package '$PKG' not found"
-        exit 1
-    fi
-
-    DESC=$(pkg_field "$PKG" "T")
-    SIZE=$(pkg_field "$PKG" "S")
-    DEPS=$(pkg_field "$PKG" "D")
+    VER=$(pkg_field "$PKG" V)
+    [ -n "$VER" ] || { echo "[ ! ] Package '$PKG' not found"; exit 1; }
 
     echo "Package:      $PKG"
     echo "Version:      $VER"
-    echo "Description:  $DESC"
-    echo "Size:         $SIZE bytes"
-    echo "Depends:      $DEPS"
-
-    if [ -f "$DB_DIR/$PKG" ]; then
-        echo "Status:       installed"
-    else
-        echo "Status:       not installed"
-    fi
+    echo "Description:  $(pkg_field "$PKG" T)"
+    echo "Size:         $(pkg_field "$PKG" S) bytes"
+    echo "Depends:      $(pkg_field "$PKG" D)"
+    if [ -f "$DB_DIR/$PKG" ]; then echo "Status:       installed"; else echo "Status:       not installed"; fi
 }
 
 cmd_install() {
     ensure_index
     PKG="$1"
-    if [ -z "$PKG" ]; then
-        echo "[ ! ] Usage: vpm install <pkg>"
-        exit 1
-    fi
+    [ -n "$PKG" ] || { echo "[ ! ] Usage: vpm install <pkg>"; exit 1; }
 
-    # Уже установлен?
+    case " $INSTALL_STACK " in *" $PKG "*) echo "[ ! ] Dependency loop around $PKG"; return 1 ;; esac
+    INSTALL_STACK="$INSTALL_STACK $PKG"
+    export INSTALL_STACK
+
     if [ -f "$DB_DIR/$PKG" ]; then
         echo "[ . ] $PKG is already installed"
-        exit 0
+        return 0
     fi
 
-    VER=$(pkg_field "$PKG" "V")
-    if [ -z "$VER" ]; then
-        echo "[ ! ] Package '$PKG' not found. Run 'vpm update' first."
-        exit 1
-    fi
+    VER=$(pkg_field "$PKG" V)
+    [ -n "$VER" ] || { echo "[ ! ] Package '$PKG' not found. Run 'vpm update' first."; exit 1; }
 
-    MIRROR=$(get_mirror)
-    APK_FILE="${PKG}-${VER}.apk"
     ensure_dirs
+    ensure_runtime_compat "$PKG"
+    install_deps "$PKG"
 
-    # Пробуем main потом community
-    DOWNLOADED=0
-    for REPO in main community; do
-        URL="${MIRROR}/${ALPINE_VER}/${REPO}/${ARCH}/${APK_FILE}"
-        echo "[ . ] Downloading $PKG-$VER from $REPO..."
-        if curl -sSf -o "${CACHE_DIR}/${APK_FILE}" "$URL"; then
-            DOWNLOADED=1
-            break
-        fi
-    done
-
-    if [ "$DOWNLOADED" -eq 0 ]; then
+    APK_FILE="${CACHE_DIR}/${PKG}-${VER}.apk"
+    if ! download_pkg "$PKG" "$VER"; then
         echo "[ ! ] Failed to download $PKG"
         exit 1
     fi
 
+    WORKDIR=$(make_tmpdir)
     echo "[ . ] Installing $PKG..."
-    # apk это gzip tar — распаковываем data.tar.gz в /
-    cd /tmp
-    tar -xzf "${CACHE_DIR}/${APK_FILE}" 2>/dev/null
-    if [ -f "data.tar.gz" ]; then
-        tar -xzf data.tar.gz -C /
-        rm -f data.tar.gz .PKGINFO .pre-install .post-install 2>/dev/null
+    ( cd "$WORKDIR" && tar -xzf "$APK_FILE" 2>/dev/null )
+    run_pkg_script "$WORKDIR/.pre-install" "$PKG" "$VER"
+
+    if [ -f "$WORKDIR/data.tar.gz" ]; then
+        tar -xzf "$WORKDIR/data.tar.gz" -C /
     else
-        # Некоторые apk просто tar.gz без обёртки
-        tar -xzf "${CACHE_DIR}/${APK_FILE}" -C / --exclude='.PKGINFO' --exclude='.pre-install' --exclude='.post-install' 2>/dev/null
+        tar -xzf "$APK_FILE" -C / --exclude='.PKGINFO' --exclude='.pre-install' --exclude='.post-install' 2>/dev/null
     fi
 
-    # Записываем в базу
-    ensure_dirs
+    record_filelist "$APK_FILE" "$WORKDIR" "$PKG"
     echo "$VER" > "$DB_DIR/$PKG"
+    run_pkg_script "$WORKDIR/.post-install" "$PKG" "$VER"
+    rm -rf "$WORKDIR"
+
+    post_install_fixes "$PKG"
     echo "[ + ] $PKG-$VER installed successfully"
 }
 
 cmd_remove() {
     PKG="$1"
-    if [ -z "$PKG" ]; then
-        echo "[ ! ] Usage: vpm remove <pkg>"
-        exit 1
-    fi
+    [ -n "$PKG" ] || { echo "[ ! ] Usage: vpm remove <pkg>"; exit 1; }
+    [ -f "$DB_DIR/$PKG" ] || { echo "[ ! ] $PKG is not installed"; exit 1; }
 
-    if [ ! -f "$DB_DIR/$PKG" ]; then
-        echo "[ ! ] $PKG is not installed"
-        exit 1
-    fi
-
-    # Получаем список файлов из кэша apk
-    VER=$(cat "$DB_DIR/$PKG")
-    APK_FILE="${CACHE_DIR}/${PKG}-${VER}.apk"
-
-    if [ -f "$APK_FILE" ]; then
-        echo "[ . ] Removing files of $PKG..."
-        cd /tmp
-        tar -xzf "$APK_FILE" 2>/dev/null
-        if [ -f "data.tar.gz" ]; then
-            # Удаляем файлы которые были установлены
-            tar -tzf data.tar.gz | grep -v '/$' | while read -r F; do
-                rm -f "/$F" 2>/dev/null
-            done
-            rm -f data.tar.gz .PKGINFO 2>/dev/null
-        fi
+    echo "[ . ] Removing files of $PKG..."
+    if [ -f "$DB_DIR/$PKG.files" ]; then
+        sort -r "$DB_DIR/$PKG.files" | while read -r F; do
+            [ -n "$F" ] || continue
+            case "$F" in /|/bin|/lib|/usr|/usr/bin|/usr/lib|/usr/share|/etc) continue ;; esac
+            if [ -d "$F" ]; then rmdir "$F" 2>/dev/null || true; else rm -f "$F" 2>/dev/null; fi
+        done
+        rm -f "$DB_DIR/$PKG.files"
     fi
 
     rm -f "$DB_DIR/$PKG"
@@ -287,13 +396,13 @@ cmd_remove() {
 
 cmd_list() {
     ensure_dirs
-    if [ -z "$(ls -A "$DB_DIR" 2>/dev/null)" ]; then
+    if [ -z "$(find "$DB_DIR" -type f ! -name '*.files' 2>/dev/null | head -n 1)" ]; then
         echo "No packages installed"
         exit 0
     fi
 
     echo "Installed packages:"
-    for PKG_FILE in "$DB_DIR"/*; do
+    find "$DB_DIR" -type f ! -name '*.files' | sort | while read -r PKG_FILE; do
         PKG=$(basename "$PKG_FILE")
         VER=$(cat "$PKG_FILE")
         printf "  %-30s %s\n" "$PKG" "$VER"
@@ -305,12 +414,12 @@ cmd_upgrade() {
     ensure_dirs
     echo "[ . ] Checking for upgrades..."
 
+    PKG_LIST=$(find "$DB_DIR" -type f ! -name '*.files' | sort)
     UPGRADED=0
-    for PKG_FILE in "$DB_DIR"/*; do
-        [ -f "$PKG_FILE" ] || continue
+    for PKG_FILE in $PKG_LIST; do
         PKG=$(basename "$PKG_FILE")
         INSTALLED_VER=$(cat "$PKG_FILE")
-        REPO_VER=$(pkg_field "$PKG" "V")
+        REPO_VER=$(pkg_field "$PKG" V)
 
         if [ -n "$REPO_VER" ] && [ "$REPO_VER" != "$INSTALLED_VER" ]; then
             echo "[ . ] Upgrading $PKG: $INSTALLED_VER -> $REPO_VER"
@@ -331,9 +440,7 @@ cmd_upgrade() {
 # Main
 # ---------------------------------------------------------------------------
 
-if [ -z "$1" ]; then
-    show_help
-fi
+[ -n "$1" ] || show_help
 
 case "$1" in
     mirror)         cmd_mirror "$2" ;;
