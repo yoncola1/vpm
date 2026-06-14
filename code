@@ -1,0 +1,350 @@
+#!/bin/sh
+
+# vpm - vomP Package Manager
+# Uses Alpine Linux repositories (musl-compatible)
+
+CONFIG_FILE="/etc/vpm.conf"
+DB_DIR="/var/db/vpm"
+CACHE_DIR="/var/cache/vpm"
+INDEX_FILE="/var/cache/vpm/APKINDEX"
+ARCH="x86_64"
+ALPINE_VER="edge"
+
+# ---------------------------------------------------------------------------
+# Mirrors
+# ---------------------------------------------------------------------------
+
+show_mirrors() {
+    echo "Available mirrors:"
+    echo "  global  - dl-cdn.alpinelinux.org (CDN, recommended)"
+    echo "  ru      - mirror.yandex.ru"
+    echo "  de      - ftp.halifax.rwth-aachen.de"
+    echo "  us      - mirrors.edge.kernel.org"
+    echo "  fr      - alpine.42.fr"
+    echo "  jp      - ftp.jaist.ac.jp"
+    echo "  nl      - nl.alpinelinux.org"
+}
+
+show_help() {
+    echo "vpm - vomP Package Manager (Alpine-based)"
+    echo ""
+    echo "Usage:"
+    echo "  vpm mirror <region>      - set mirror (ru/de/us/fr/jp/nl/global)"
+    echo "  vpm mirror?              - show current mirror"
+    echo "  vpm update               - sync package index"
+    echo "  vpm search <pkg>         - search for package"
+    echo "  vpm info <pkg>           - show package info"
+    echo "  vpm install <pkg>        - install package"
+    echo "  vpm remove <pkg>         - remove package"
+    echo "  vpm list                 - list installed packages"
+    echo "  vpm upgrade              - upgrade all installed packages"
+    echo ""
+    show_mirrors
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+get_mirror() {
+    if [ -f "$CONFIG_FILE" ]; then
+        cat "$CONFIG_FILE"
+    else
+        echo "https://dl-cdn.alpinelinux.org/alpine"
+    fi
+}
+
+ensure_dirs() {
+    mkdir -p "$DB_DIR" "$CACHE_DIR"
+}
+
+ensure_index() {
+    if [ ! -f "$INDEX_FILE" ]; then
+        echo "[ ! ] Package index not found. Run: vpm update"
+        exit 1
+    fi
+}
+
+# Парсим APKINDEX — поля разделены переносами строк, записи пустой строкой
+# P: name
+# V: version
+# S: size
+# D: depends
+# T: description
+pkg_field() {
+    PKG="$1"
+    FIELD="$2"
+    awk -v pkg="$PKG" -v field="$FIELD" '
+        /^$/ { found=0 }
+        /^P:/ { if ($0 == "P:"pkg) found=1 }
+        found && /^[A-Z]:/ { if (substr($0,1,2) == field":") { print substr($0,3); exit } }
+    ' "$INDEX_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_mirror() {
+    if [ -z "$1" ] || [ "$1" = "?" ]; then
+        echo "vpm mirror: $(get_mirror)"
+        exit 0
+    fi
+
+    REGION=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+    case "$REGION" in
+        global|cdn|worldwide) URL="http://dl-cdn.alpinelinux.org/alpine" ;;
+        ru|russia)            URL="http://mirror.yandex.ru/mirrors/alpine" ;;
+        de|germany)           URL="http://ftp.halifax.rwth-aachen.de/alpine" ;;
+        us|usa)               URL="http://mirrors.edge.kernel.org/alpine" ;;
+        fr|france)            URL="http://alpine.42.fr/alpine" ;;
+        jp|japan)             URL="http://ftp.jaist.ac.jp/pub/Linux/alpine" ;;
+        nl|netherlands)       URL="http://nl.alpinelinux.org/alpine" ;;
+        *)
+            echo "[ ! ] Unknown region '$1', using CDN"
+            URL="https://dl-cdn.alpinelinux.org/alpine"
+            ;;
+    esac
+
+    ensure_dirs
+    echo "$URL" > "$CONFIG_FILE"
+    echo "[ + ] Mirror set to: $URL"
+    echo "[ . ] Run 'vpm update' to sync package index"
+}
+
+cmd_update() {
+    ensure_dirs
+    MIRROR=$(get_mirror)
+    REPOS="main community"
+
+    echo "[ . ] Syncing package index from $MIRROR ..."
+    rm -f "$INDEX_FILE"
+
+    for REPO in $REPOS; do
+        URL="${MIRROR}/${ALPINE_VER}/${REPO}/${ARCH}/APKINDEX.tar.gz"
+        TMP="/tmp/APKINDEX_${REPO}.tar.gz"
+        echo "[ . ] Fetching $REPO..."
+        if curl -sSf -o "$TMP" "$URL"; then
+            # Распаковываем и добавляем к общему индексу
+            tar -xOf "$TMP" APKINDEX 2>/dev/null >> "$INDEX_FILE"
+            echo "" >> "$INDEX_FILE"
+            rm -f "$TMP"
+            echo "[ + ] $REPO OK"
+        else
+            echo "[ ! ] Failed to fetch $REPO index"
+        fi
+    done
+
+    TOTAL=$(grep "^P:" "$INDEX_FILE" | wc -l)
+    echo "[ + ] Done! $TOTAL packages available"
+}
+
+cmd_search() {
+    ensure_index
+    PKG="$1"
+    if [ -z "$PKG" ]; then
+        echo "[ ! ] Usage: vpm search <pkg>"
+        exit 1
+    fi
+
+    echo "[ . ] Searching for '$PKG'..."
+    RESULTS=$(grep "^P:.*${PKG}" "$INDEX_FILE" | sed 's/^P://')
+
+    if [ -z "$RESULTS" ]; then
+        echo "[ ! ] No packages found matching '$PKG'"
+        exit 1
+    fi
+
+    echo "$RESULTS" | while read -r NAME; do
+        VER=$(pkg_field "$NAME" "V")
+        DESC=$(pkg_field "$NAME" "T")
+        printf "  %-30s %-15s %s\n" "$NAME" "$VER" "$DESC"
+    done
+}
+
+cmd_info() {
+    ensure_index
+    PKG="$1"
+    if [ -z "$PKG" ]; then
+        echo "[ ! ] Usage: vpm info <pkg>"
+        exit 1
+    fi
+
+    VER=$(pkg_field "$PKG" "V")
+    if [ -z "$VER" ]; then
+        echo "[ ! ] Package '$PKG' not found"
+        exit 1
+    fi
+
+    DESC=$(pkg_field "$PKG" "T")
+    SIZE=$(pkg_field "$PKG" "S")
+    DEPS=$(pkg_field "$PKG" "D")
+
+    echo "Package:      $PKG"
+    echo "Version:      $VER"
+    echo "Description:  $DESC"
+    echo "Size:         $SIZE bytes"
+    echo "Depends:      $DEPS"
+
+    if [ -f "$DB_DIR/$PKG" ]; then
+        echo "Status:       installed"
+    else
+        echo "Status:       not installed"
+    fi
+}
+
+cmd_install() {
+    ensure_index
+    PKG="$1"
+    if [ -z "$PKG" ]; then
+        echo "[ ! ] Usage: vpm install <pkg>"
+        exit 1
+    fi
+
+    # Уже установлен?
+    if [ -f "$DB_DIR/$PKG" ]; then
+        echo "[ . ] $PKG is already installed"
+        exit 0
+    fi
+
+    VER=$(pkg_field "$PKG" "V")
+    if [ -z "$VER" ]; then
+        echo "[ ! ] Package '$PKG' not found. Run 'vpm update' first."
+        exit 1
+    fi
+
+    MIRROR=$(get_mirror)
+    APK_FILE="${PKG}-${VER}.apk"
+    ensure_dirs
+
+    # Пробуем main потом community
+    DOWNLOADED=0
+    for REPO in main community; do
+        URL="${MIRROR}/${ALPINE_VER}/${REPO}/${ARCH}/${APK_FILE}"
+        echo "[ . ] Downloading $PKG-$VER from $REPO..."
+        if curl -sSf -o "${CACHE_DIR}/${APK_FILE}" "$URL"; then
+            DOWNLOADED=1
+            break
+        fi
+    done
+
+    if [ "$DOWNLOADED" -eq 0 ]; then
+        echo "[ ! ] Failed to download $PKG"
+        exit 1
+    fi
+
+    echo "[ . ] Installing $PKG..."
+    # apk это gzip tar — распаковываем data.tar.gz в /
+    cd /tmp
+    tar -xzf "${CACHE_DIR}/${APK_FILE}" 2>/dev/null
+    if [ -f "data.tar.gz" ]; then
+        tar -xzf data.tar.gz -C /
+        rm -f data.tar.gz .PKGINFO .pre-install .post-install 2>/dev/null
+    else
+        # Некоторые apk просто tar.gz без обёртки
+        tar -xzf "${CACHE_DIR}/${APK_FILE}" -C / --exclude='.PKGINFO' --exclude='.pre-install' --exclude='.post-install' 2>/dev/null
+    fi
+
+    # Записываем в базу
+    ensure_dirs
+    echo "$VER" > "$DB_DIR/$PKG"
+    echo "[ + ] $PKG-$VER installed successfully"
+}
+
+cmd_remove() {
+    PKG="$1"
+    if [ -z "$PKG" ]; then
+        echo "[ ! ] Usage: vpm remove <pkg>"
+        exit 1
+    fi
+
+    if [ ! -f "$DB_DIR/$PKG" ]; then
+        echo "[ ! ] $PKG is not installed"
+        exit 1
+    fi
+
+    # Получаем список файлов из кэша apk
+    VER=$(cat "$DB_DIR/$PKG")
+    APK_FILE="${CACHE_DIR}/${PKG}-${VER}.apk"
+
+    if [ -f "$APK_FILE" ]; then
+        echo "[ . ] Removing files of $PKG..."
+        cd /tmp
+        tar -xzf "$APK_FILE" 2>/dev/null
+        if [ -f "data.tar.gz" ]; then
+            # Удаляем файлы которые были установлены
+            tar -tzf data.tar.gz | grep -v '/$' | while read -r F; do
+                rm -f "/$F" 2>/dev/null
+            done
+            rm -f data.tar.gz .PKGINFO 2>/dev/null
+        fi
+    fi
+
+    rm -f "$DB_DIR/$PKG"
+    echo "[ + ] $PKG removed"
+}
+
+cmd_list() {
+    ensure_dirs
+    if [ -z "$(ls -A "$DB_DIR" 2>/dev/null)" ]; then
+        echo "No packages installed"
+        exit 0
+    fi
+
+    echo "Installed packages:"
+    for PKG_FILE in "$DB_DIR"/*; do
+        PKG=$(basename "$PKG_FILE")
+        VER=$(cat "$PKG_FILE")
+        printf "  %-30s %s\n" "$PKG" "$VER"
+    done
+}
+
+cmd_upgrade() {
+    ensure_index
+    ensure_dirs
+    echo "[ . ] Checking for upgrades..."
+
+    UPGRADED=0
+    for PKG_FILE in "$DB_DIR"/*; do
+        [ -f "$PKG_FILE" ] || continue
+        PKG=$(basename "$PKG_FILE")
+        INSTALLED_VER=$(cat "$PKG_FILE")
+        REPO_VER=$(pkg_field "$PKG" "V")
+
+        if [ -n "$REPO_VER" ] && [ "$REPO_VER" != "$INSTALLED_VER" ]; then
+            echo "[ . ] Upgrading $PKG: $INSTALLED_VER -> $REPO_VER"
+            rm -f "$DB_DIR/$PKG"
+            cmd_install "$PKG"
+            UPGRADED=$((UPGRADED + 1))
+        fi
+    done
+
+    if [ "$UPGRADED" -eq 0 ]; then
+        echo "[ + ] All packages are up to date"
+    else
+        echo "[ + ] Upgraded $UPGRADED packages"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+if [ -z "$1" ]; then
+    show_help
+fi
+
+case "$1" in
+    mirror)         cmd_mirror "$2" ;;
+    "mirror?")      cmd_mirror "?" ;;
+    update|sync)    cmd_update ;;
+    search)         cmd_search "$2" ;;
+    info)           cmd_info "$2" ;;
+    install)        cmd_install "$2" ;;
+    remove|del|rm)  cmd_remove "$2" ;;
+    list|ls)        cmd_list ;;
+    upgrade)        cmd_upgrade ;;
+    help|--help|-h) show_help ;;
+    *)              echo "[ ! ] Unknown command: $1"; show_help ;;
+esac
